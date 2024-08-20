@@ -13,6 +13,7 @@ use custom_error::custom_error;
 
 const OVERLAY_SIZE_BYTES: usize = 40;
 
+/// Clock overlay.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClockOverlay {
     pub clock_id: i64,
@@ -30,6 +31,12 @@ custom_error! { pub OverlayReceiveError
 
 const PROTOCOL_MAJOR_VERSION: u16 = 1;
 const PROTOCOL_MINOR_VERSION: u16 = 0;
+
+#[inline(always)]
+fn clock_now_ns(clock: nix::time::ClockId) -> i64 {
+    let timespec = clock.now().unwrap();
+    timespec.tv_sec().wrapping_mul(1_000_000_000).wrapping_add(timespec.tv_nsec())
+}
 
 impl ClockOverlay {
     fn decode(buff: &[u8]) -> Result<Self, OverlayReceiveError> {
@@ -55,26 +62,121 @@ impl ClockOverlay {
         })
     }
 
+    /// Calculates timestamp in overlay clock's timescale given underlying clock's timestamp.
+    /// All timestamps are in nanoseconds and may wrap.
     pub fn underlying_to_overlay_ns(&self, timestamp: i64) -> i64 {
         let elapsed = timestamp.wrapping_sub(self.last_sync);
         let correction = ((elapsed as f64) * self.freq_scale).round() as i64;
         timestamp.wrapping_add(self.shift).wrapping_add(correction)
     }
 
+    /// Returns current underlying clock's timestamp in nanoseconds. May wrap.
     #[cfg(feature="unix")]
     pub fn now_underlying_ns(&self) -> i64 {
-        let timespec = nix::time::ClockId::from_raw(self.clock_id as nix::libc::clockid_t).now().unwrap();
-        timespec.tv_sec().wrapping_mul(1_000_000_000).wrapping_add(timespec.tv_nsec())
+        clock_now_ns(nix::time::ClockId::from_raw(self.clock_id as nix::libc::clockid_t))
     }
 
+    /// Returns current timestamp (in nanoseconds) obtained from underlying clock, then shifted and scaled to overlay clock's timescale. May wrap.
     #[cfg(feature="unix")]
     pub fn now_ns(&self) -> i64 {
         self.underlying_to_overlay_ns(self.now_underlying_ns())
     }
 }
 
+#[cfg(feature="unix")]
+/// Guarded clock.
+/// 
+/// Workaround for situations where the underlying clock isn't guaranteed to be monotonic.
+/// It may happen because software-timestamped network sockets can only use CLOCK_REALTIME which is settable via NTP.
+/// Then, before PTP daemon notices that clock jumped and updates shift, we may have discontinuity.
+/// It will hopefully get back to normal values after a while.
+/// 
+/// This wrapper does not protect from permanent clock jumps (e.g. the only master is restarted),
+/// it will return [`SafeTimestamp`] with `estimated` set to `true` forever and never use the new overlay in such cases.
+pub struct SafeClock {
+    guard_clock: nix::time::ClockId,
+    last_update: Option<(i64, i64)>,
+    tolerance_ns: i64,
+}
+
+/// Timestamp returned by [`SafeClock::now`]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SafeTimestamp {
+    /// Timestamp in nanoseconds. May wrap.
+    pub nanos: i64,
+    /// Whether timestamp was estimated because time from overlay clock looked suspicious.
+    pub estimated: bool,
+}
+
+impl SafeTimestamp {
+    /// Returns `Some(nanoseconds)` if timestamp wasn't estimated (should be precise), `None` otherwise.
+    pub fn precise_ns(&self) -> Option<i64> {
+        if !self.estimated {
+            Some(self.nanos)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(feature="unix")]
+impl SafeClock {
+    /// Creates new `SafeClock` with specified tolerance in nanoseconds and a default guard clock.
+    /// 
+    /// To prevent false detection of clock jumps, tolerance should be larger than maximum expected clock drift that can accumulate between
+    /// subsequent calls to [`SafeClock::now`].
+    pub fn new(tolerance_ns: i64) -> Self {
+        Self::new_with_guard(tolerance_ns, nix::time::ClockId::CLOCK_MONOTONIC)
+    }
+
+    /// Creates new `SafeClock` with specified tolerance in nanoseconds and specified guard clock.
+    /// 
+    /// Guard clock should be monotonic to serve its function ([`nix::time::ClockId::CLOCK_MONOTONIC`] or its variant `_RAW`, `_COARSE`, `_FAST`, `_PRECISE`).
+    /// 
+    /// To prevent false detection of clock jumps, tolerance should be larger than maximum expected clock drift that can accumulate between
+    /// subsequent calls to [`SafeClock::now`].
+    pub fn new_with_guard(tolerance_ns: i64, guard_clock: nix::time::ClockId) -> Self {
+        Self {
+            guard_clock,
+            last_update: None,
+            tolerance_ns
+        }
+    }
+
+    /// Returns current timestamp. Checks whether overlay's underlying clock has jumped, with tolerance specified in [`SafeClock::new`].
+    pub fn now(&mut self, overlay: &ClockOverlay) -> SafeTimestamp {
+        let now_main = overlay.now_ns();
+        if (overlay.clock_id as nix::libc::clockid_t) == self.guard_clock.as_raw() {
+            return SafeTimestamp{ nanos: now_main, estimated: false };
+        }
+
+        let now_guard = clock_now_ns(self.guard_clock);
+        let mut update_last = true;
+        let now = if let &Some((last_main, last_guard)) = &self.last_update {
+            let elapsed_main = now_main.wrapping_sub(last_main);
+            let elapsed_guard = now_guard.wrapping_sub(last_guard);
+            debug_assert!(elapsed_guard >= 0);
+            if (elapsed_main < 0) || (elapsed_main.wrapping_sub(elapsed_guard).abs() > self.tolerance_ns) {
+                update_last = false;
+                SafeTimestamp{ nanos: last_main.wrapping_add(elapsed_guard), estimated: true }
+            } else {
+                SafeTimestamp{ nanos: now_main, estimated: false }
+            }
+        } else {
+            SafeTimestamp{ nanos: now_main, estimated: false }
+        };
+        if update_last {
+            self.last_update = Some((now_main, now_guard));
+        }
+        now
+    }
+}
+
+
+/// Default path to usrvclock datagram Unix-domain socket
 pub const DEFAULT_SERVER_SOCKET_PATH: &str = "/tmp/ptp-usrvclock";
 
+/// usrvclock protocol server - transmitter of clock overlay updates
 pub struct Server {
     socket_path: PathBuf,
     socket: UnixDatagram,
@@ -82,6 +184,7 @@ pub struct Server {
 }
 
 impl Server {
+    /// Creates new server
     pub fn new(path: PathBuf) -> std::io::Result<Self> {
         let _ = std::fs::remove_file(&path);
         let socket = UnixDatagram::bind(&path)?;
@@ -92,6 +195,13 @@ impl Server {
             clients: vec![],
         })
     }
+
+    /// Sends overlay update to connected clients.
+    /// 
+    /// This function is non-blocking.
+    /// 
+    /// It is recommended to call it at least once per second. Otherwise newly connected clients will wait too long for the first update.
+    /// This recommendation may be removed in future versions.
     pub fn send(&mut self, overlay: ClockOverlay) {
         let flags: u16 = 1;
         let mut buff = [0u8; OVERLAY_SIZE_BYTES];
@@ -137,6 +247,9 @@ fn client_socket_path(counter: i32) -> PathBuf {
     path
 }
 
+/// Blocking client of usrvclock protocol - receiver of clock overlay updates.
+/// It is very simple and doesn't allow unblocking (needed for graceful exit).
+/// It is recommended to use the async version ([`AsyncClient`]) if possible because it doesn't have this shortcoming.
 pub struct BlockingClient {
     socket_path: PathBuf,
     local_path: Option<PathBuf>,
@@ -144,6 +257,7 @@ pub struct BlockingClient {
 }
 
 impl BlockingClient {
+    /// Creates new client
     pub fn new(path: PathBuf) -> Self {
         Self {
             socket_path: path,
@@ -151,6 +265,10 @@ impl BlockingClient {
             socket: None,
         }
     }
+
+    /// Receives a single overlay update. If the server stops (is restarted, crashes etc.), it will try to connect again.
+    /// 
+    /// This function is blocking.
     pub fn recv(&mut self) -> Result<ClockOverlay, OverlayReceiveError> {
         let mut counter = 0;
         loop {
@@ -188,6 +306,10 @@ impl BlockingClient {
     }
 }
 
+/// Async client utilizing the [`tokio`] library - receiver of clock overlay updates.
+/// 
+/// Overlay updates are sent to [`tokio::sync::broadcast`] channel which can be subscribed using [`AsyncClient::subscribe`].
+/// Errors are passed to `error_handler` callback specified when starting the client.
 #[cfg(feature="tokio")]
 pub struct AsyncClient {
     shutdown: tokio::sync::oneshot::Sender<()>,
@@ -197,6 +319,12 @@ pub struct AsyncClient {
 
 #[cfg(feature="tokio")]
 impl AsyncClient {
+    /// Starts the client coroutine using [`tokio::spawn`]. Returns [`AsyncClient`] instance.
+    /// 
+    /// `path` is server socket path. It must be configurable by user and default to [`DEFAULT_SERVER_SOCKET_PATH`],
+    /// unless your application has a good reason to use a different convention (e.g. it supports multiple PTP clock domains)
+    /// 
+    /// `error_handler` is a callback which should print warning messages to the user
     pub fn start(path: PathBuf, error_handler: Box<dyn FnMut(OverlayReceiveError) + Send>) -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
@@ -274,10 +402,15 @@ impl AsyncClient {
             join_handle
         }
     }
-    pub fn stop(self) -> tokio::task::JoinHandle<()> {
+
+    /// Stops running client coroutine
+    pub async fn stop(self) -> Result<(), tokio::task::JoinError> {
         let _ = self.shutdown.send(());
-        self.join_handle
+        self.join_handle.await
     }
+
+    /// Subscribes to clock overlay changes. Returns [`tokio::sync::broadcast::Receiver`].
+    /// Call `.recv().await` on it to get `Option<ClockOverlay>` which will be `None` if [`AsyncClient::stop`] was called or `Some` in all other cases.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ClockOverlay> {
         self.sender.subscribe()
     }
@@ -421,5 +554,41 @@ mod tests {
         let overlay_ts = shifting_fast_overlay.now_ns();
         assert!((overlay_ts - 300_000_000).abs() < epsilon_ns);
 
+    }
+
+    #[cfg(feature="unix")]
+    #[test]
+    fn safe_clock() {
+        let epsilon_ns = 5_000_000; // 5 ms
+        let mut overlay = ClockOverlay {
+            clock_id: nix::time::ClockId::CLOCK_MONOTONIC_RAW.as_raw() as i64,
+            last_sync: 0,
+            shift: 0,
+            freq_scale: 0.0
+        };
+        let mut safe = SafeClock::new(epsilon_ns);
+
+        let ts1 = safe.now(&overlay);
+        assert!(!ts1.estimated);
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let ts2 = safe.now(&overlay);
+        assert!(!ts2.estimated);
+        let diff = ts2.nanos.wrapping_sub(ts1.nanos);
+        assert!((diff - 200_000_000).abs() < epsilon_ns);
+
+        overlay.shift += 20_000_000;
+        let ts3 = safe.now(&overlay);
+        assert!(ts3.estimated);
+        assert!(ts3.nanos.wrapping_sub(ts2.nanos).abs() < epsilon_ns);
+
+        std::thread::sleep(Duration::from_millis(150));
+
+        overlay.shift -= 21_000_000;
+        let ts4 = safe.now(&overlay);
+        assert!(!ts4.estimated);
+        let diff = ts4.nanos.wrapping_sub(ts2.nanos);
+        assert!((diff - 149_000_000).abs() < epsilon_ns);
     }
 }
