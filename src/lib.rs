@@ -189,6 +189,12 @@ impl Server {
         let _ = std::fs::remove_file(&path);
         let socket = UnixDatagram::bind(&path)?;
         socket.set_nonblocking(true)?;
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            let _ = std::fs::set_permissions(&path, permissions);
+        }
+
         Ok(Self {
             socket_path: path,
             socket,
