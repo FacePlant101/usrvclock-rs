@@ -35,7 +35,7 @@ const PROTOCOL_MINOR_VERSION: u16 = 0;
 #[inline(always)]
 fn clock_now_ns(clock: nix::time::ClockId) -> i64 {
     let timespec = clock.now().unwrap();
-    timespec.tv_sec().wrapping_mul(1_000_000_000).wrapping_add(timespec.tv_nsec())
+    (timespec.tv_sec() as i64).wrapping_mul(1_000_000_000i64).wrapping_add(timespec.tv_nsec() as i64)
 }
 
 impl ClockOverlay {
