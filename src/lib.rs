@@ -9,6 +9,7 @@
 
 use std::{os::unix::net::{SocketAddr, UnixDatagram}, path::PathBuf, sync::Mutex, time::Duration};
 use custom_error::custom_error;
+use nix::{fcntl::OFlag, libc::{O_RDONLY, S_IFCHR, S_IFMT}, sys::stat::Mode, time::ClockId};
 
 
 const OVERLAY_SIZE_BYTES: usize = 40;
@@ -319,7 +320,7 @@ impl BlockingClient {
 #[cfg(feature="tokio")]
 pub struct AsyncClient {
     shutdown: tokio::sync::oneshot::Sender<()>,
-    sender: tokio::sync::broadcast::Sender<ClockOverlay>,
+    sender: tokio::sync::watch::Sender<Option<ClockOverlay>>,
     join_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -333,75 +334,92 @@ impl AsyncClient {
     /// `error_handler` is a callback which should print warning messages to the user
     pub fn start(path: PathBuf, error_handler: Box<dyn FnMut(OverlayReceiveError) + Send>) -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let tx = tokio::sync::watch::Sender::new(None);
         let sender = tx.clone();
 
         let path = path.to_owned();
-        let join_handle = tokio::spawn(async move {
-            async fn recv_loop(
-                path: PathBuf,
-                tx: tokio::sync::broadcast::Sender<ClockOverlay>,
-                mut error_handler: Box<dyn FnMut(OverlayReceiveError) + Send>,
-                file_to_delete: &Mutex<Option<PathBuf>>
-            ) {
-                let mut socket_opt: Option<(tokio::net::UnixDatagram, PathBuf)> = None;
-                let mut counter: i32 = 0;
-                loop {
-                    if socket_opt.is_none() {
-                        let local_path = client_socket_path(counter);
-                        counter += 1;
-                        let result = tokio::net::UnixDatagram::bind(&local_path);
-                        match result {
-                            Ok(socket) => {
-                                if socket.connect(&path).is_err() || socket.send(&[]).await.is_err() {
-                                    drop(socket);
-                                    let _ = std::fs::remove_file(&local_path);
+        println!("path: {path:?}");
+        let join_handle = if nix::sys::stat::stat(&path).map(|stat|(stat.st_mode & S_IFMT)==S_IFCHR).unwrap_or(false) {
+            println!("opening device");
+            let fd = nix::fcntl::open(&path, OFlag::O_RDONLY, Mode::empty()).unwrap();
+            let clock_id = (!fd << 3) | 3;
+            tx.send_replace(Some(ClockOverlay {
+                clock_id: clock_id.into(),
+                last_sync: 0,
+                shift: 0,
+                freq_scale: 0.0
+            }));
+            tokio::spawn(async move {
+                shutdown_rx.await;
+                nix::unistd::close(fd); // TODO FIXME ClockOverlay.now() may still use this clock!!!
+            })
+        } else {
+            tokio::spawn(async move {
+                async fn recv_loop(
+                    path: PathBuf,
+                    tx: tokio::sync::watch::Sender<Option<ClockOverlay>>,
+                    mut error_handler: Box<dyn FnMut(OverlayReceiveError) + Send>,
+                    file_to_delete: &Mutex<Option<PathBuf>>
+                ) {
+                    let mut socket_opt: Option<(tokio::net::UnixDatagram, PathBuf)> = None;
+                    let mut counter: i32 = 0;
+                    loop {
+                        if socket_opt.is_none() {
+                            let local_path = client_socket_path(counter);
+                            counter += 1;
+                            let result = tokio::net::UnixDatagram::bind(&local_path);
+                            match result {
+                                Ok(socket) => {
+                                    if socket.connect(&path).is_err() || socket.send(&[]).await.is_err() {
+                                        drop(socket);
+                                        let _ = std::fs::remove_file(&local_path);
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                    } else {
+                                        *file_to_delete.lock().unwrap() = Some(local_path.clone());
+                                        socket_opt = Some((socket, local_path));
+                                    }
+                                },
+                                Err(_e) => {
                                     tokio::time::sleep(Duration::from_millis(250)).await;
-                                } else {
-                                    *file_to_delete.lock().unwrap() = Some(local_path.clone());
-                                    socket_opt = Some((socket, local_path));
                                 }
-                            },
-                            Err(_e) => {
-                                tokio::time::sleep(Duration::from_millis(250)).await;
                             }
                         }
-                    }
-                    if let Some((socket, local_path)) = &socket_opt {
-                        let mut buff = [0u8; OVERLAY_SIZE_BYTES];
-                        match socket.recv(&mut buff).await {
-                            Ok(size) => {
-                                match ClockOverlay::decode(&buff[0..size]) {
-                                    Ok(v) => {
-                                        let _ = tx.send(v);
-                                    },
-                                    Err(e) => {
-                                        (error_handler)(e);
+                        if let Some((socket, local_path)) = &socket_opt {
+                            let mut buff = [0u8; OVERLAY_SIZE_BYTES];
+                            match socket.recv(&mut buff).await {
+                                Ok(size) => {
+                                    match ClockOverlay::decode(&buff[0..size]) {
+                                        Ok(v) => {
+                                            let _ = tx.send(Some(v));
+                                        },
+                                        Err(e) => {
+                                            (error_handler)(e);
+                                        }
                                     }
+                                },
+                                _ => {
+                                    let _ = std::fs::remove_file(&local_path);
+                                    *file_to_delete.lock().unwrap() = None;
+                                    socket_opt = None;
                                 }
-                            },
-                            _ => {
-                                let _ = std::fs::remove_file(&local_path);
-                                *file_to_delete.lock().unwrap() = None;
-                                socket_opt = None;
                             }
                         }
                     }
                 }
-            }
 
-            let file_to_delete = Mutex::new(None);
+                let file_to_delete = Mutex::new(None);
 
-            tokio::select! {
-                _ = recv_loop(path, tx, error_handler, &file_to_delete) => {},
-                _ = shutdown_rx => {}
-            };
+                tokio::select! {
+                    _ = recv_loop(path, tx, error_handler, &file_to_delete) => {},
+                    _ = shutdown_rx => {}
+                };
 
-            let file_to_delete = file_to_delete.into_inner().unwrap();
-            if let Some(todelete) = file_to_delete {
-                let _ = std::fs::remove_file(&todelete);
-            }
-        });
+                let file_to_delete = file_to_delete.into_inner().unwrap();
+                if let Some(todelete) = file_to_delete {
+                    let _ = std::fs::remove_file(&todelete);
+                }
+            })
+        };
         Self {
             sender,
             shutdown: shutdown_tx,
@@ -415,9 +433,8 @@ impl AsyncClient {
         self.join_handle.await
     }
 
-    /// Subscribes to clock overlay changes. Returns [`tokio::sync::broadcast::Receiver`].
-    /// Call `.recv().await` on it to get `Option<ClockOverlay>` which will be `None` if [`AsyncClient::stop`] was called or `Some` in all other cases.
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ClockOverlay> {
+    /// Subscribes to clock overlay changes. Returns [`tokio::sync::watch::Receiver`].
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<ClockOverlay>> {
         self.sender.subscribe()
     }
 }
@@ -474,9 +491,11 @@ mod tests {
         let mut receiver1 = client.subscribe();
         let mut receiver2 = client.subscribe();
         for _ in 0..2 {
-            let overlay = receiver1.recv().await.unwrap();
+            receiver1.changed().await;
+            let overlay = receiver1.borrow().unwrap();
             assert_eq!(overlay, test_overlay);
-            let overlay = receiver2.recv().await.unwrap();
+            receiver2.changed().await;
+            let overlay = receiver2.borrow().unwrap();
             assert_eq!(overlay, test_overlay);
         }
         client.stop().await.unwrap();
