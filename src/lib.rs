@@ -9,7 +9,7 @@
 
 use std::{os::unix::net::{SocketAddr, UnixDatagram}, path::PathBuf, sync::Mutex, time::Duration};
 use custom_error::custom_error;
-use nix::{fcntl::OFlag, libc::{O_RDONLY, S_IFCHR, S_IFMT}, sys::stat::Mode, time::ClockId};
+use nix::{fcntl::OFlag, libc::{O_RDONLY, S_IFCHR, S_IFMT}, sys::stat::Mode, time::ClockId, libc};
 
 
 const OVERLAY_SIZE_BYTES: usize = 40;
@@ -32,6 +32,84 @@ custom_error! { pub OverlayReceiveError
 
 const PROTOCOL_MAJOR_VERSION: u16 = 1;
 const PROTOCOL_MINOR_VERSION: u16 = 0;
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub const EMPTY_TIMEX: libc::timex = libc::timex {
+    modes: 0,
+    offset: 0,
+    freq: 0,
+    maxerror: 0,
+    esterror: 0,
+    status: 0,
+    constant: 0,
+    precision: 0,
+    tolerance: 0,
+    time: libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    },
+    tick: 0,
+    ppsfreq: 0,
+    jitter: 0,
+    shift: 0,
+    stabil: 0,
+    jitcnt: 0,
+    calcnt: 0,
+    errcnt: 0,
+    stbcnt: 0,
+    tai: 0,
+    __unused1: 0,
+    __unused2: 0,
+    __unused3: 0,
+    __unused4: 0,
+    __unused5: 0,
+    __unused6: 0,
+    __unused7: 0,
+    __unused8: 0,
+    __unused9: 0,
+    __unused10: 0,
+    __unused11: 0,
+};
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+pub const EMPTY_TIMEX: libc::timex = libc::timex {
+    modes: 0,
+    offset: 0,
+    freq: 0,
+    maxerror: 0,
+    esterror: 0,
+    status: 0,
+    constant: 0,
+    precision: 0,
+    tolerance: 0,
+    time: libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    },
+    tick: 0,
+    ppsfreq: 0,
+    jitter: 0,
+    shift: 0,
+    stabil: 0,
+    jitcnt: 0,
+    calcnt: 0,
+    errcnt: 0,
+    stbcnt: 0,
+    tai: 0,
+    __padding: [0; 11],
+};
+
+fn errno() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        *libc::__error()
+    }
+}
 
 #[inline(always)]
 fn clock_now_ns(clock: nix::time::ClockId) -> i64 {
@@ -81,6 +159,19 @@ impl ClockOverlay {
     #[cfg(feature="unix")]
     pub fn now_ns(&self) -> i64 {
         self.underlying_to_overlay_ns(self.now_underlying_ns())
+    }
+
+    /// Returns actual frequency correction factor, adjusted for hardware clock's scale
+    #[cfg(target_os="linux")]
+    pub fn freq_scale_including_hw(&self) -> f64 {
+        let mut timex = libc::timex {
+            ..EMPTY_TIMEX
+        };
+        // safety: clock_id is believed to be open
+        // TODO: handle errors
+        let _r = unsafe { libc::clock_adjtime(self.clock_id as _, &mut timex) };
+        //println!("raw freq offset {} result {r} errno {}", timex.freq, errno());
+        (timex.freq as f64 / 65_536_000_000.0) + self.freq_scale
     }
 }
 
@@ -338,11 +429,15 @@ impl AsyncClient {
         let sender = tx.clone();
 
         let path = path.to_owned();
-        println!("path: {path:?}");
+        //println!("path: {path:?}");
         let join_handle = if nix::sys::stat::stat(&path).map(|stat|(stat.st_mode & S_IFMT)==S_IFCHR).unwrap_or(false) {
-            println!("opening device");
-            let fd = nix::fcntl::open(&path, OFlag::O_RDONLY, Mode::empty()).unwrap();
-            let clock_id = (!fd << 3) | 3;
+            //println!("opening device");
+            let fd = nix::fcntl::open(&path, OFlag::O_RDWR, Mode::empty()).unwrap_or_else(|_| {
+                // retry without writing, however, freq_scale_including_hw will return invalid values
+                //println!("unable to open clock for writing, clock_adjtime will not work so freq_scale_including_hw will be inaccurate!");
+                nix::fcntl::open(&path, OFlag::O_RDONLY, Mode::empty()).unwrap()
+            });
+            let clock_id = ((!(fd as libc::clockid_t)) << 3) | 3;
             tx.send_replace(Some(ClockOverlay {
                 clock_id: clock_id.into(),
                 last_sync: 0,
