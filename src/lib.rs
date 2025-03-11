@@ -182,13 +182,13 @@ impl ClockOverlay {
 /// It may happen because software-timestamped network sockets can only use CLOCK_REALTIME which is settable via NTP.
 /// Then, before PTP daemon notices that clock jumped and updates shift, we may have discontinuity.
 /// It will hopefully get back to normal values after a while.
-/// 
-/// This wrapper does not protect from permanent clock jumps (e.g. the only master is restarted),
-/// it will return [`SafeTimestamp`] with `estimated` set to `true` forever and never use the new overlay in such cases.
+/// If it does not within a given timeout, SafeClock won't wait anymore and return input timestamp.
 pub struct SafeClock {
     guard_clock: nix::time::ClockId,
     last_update: Option<(i64, i64)>,
-    tolerance_ns: i64,
+    tolerance: f64,
+    timeout_ns: i64,
+    skewed: bool,
 }
 
 /// Timestamp returned by [`SafeClock::now`]
@@ -213,25 +213,27 @@ impl SafeTimestamp {
 
 #[cfg(feature="unix")]
 impl SafeClock {
-    /// Creates new `SafeClock` with specified tolerance in nanoseconds and a default guard clock.
+    /// Creates new `SafeClock` with specified tolerance (in fractional seconds per second) and a default guard clock.
     /// 
     /// To prevent false detection of clock jumps, tolerance should be larger than maximum expected clock drift that can accumulate between
     /// subsequent calls to [`SafeClock::now`].
-    pub fn new(tolerance_ns: i64) -> Self {
-        Self::new_with_guard(tolerance_ns, nix::time::ClockId::CLOCK_MONOTONIC)
+    pub fn new(tolerance: f64, timeout_ns: i64) -> Self {
+        Self::new_with_guard(tolerance, timeout_ns, nix::time::ClockId::CLOCK_MONOTONIC)
     }
 
-    /// Creates new `SafeClock` with specified tolerance in nanoseconds and specified guard clock.
+    /// Creates new `SafeClock` with specified tolerance (in fractional seconds per second) and specified guard clock.
     /// 
     /// Guard clock should be monotonic to serve its function ([`nix::time::ClockId::CLOCK_MONOTONIC`] or its variant `_RAW`, `_COARSE`, `_FAST`, `_PRECISE`).
     /// 
     /// To prevent false detection of clock jumps, tolerance should be larger than maximum expected clock drift that can accumulate between
     /// subsequent calls to [`SafeClock::now`].
-    pub fn new_with_guard(tolerance_ns: i64, guard_clock: nix::time::ClockId) -> Self {
+    pub fn new_with_guard(tolerance: f64, timeout_ns: i64, guard_clock: nix::time::ClockId) -> Self {
         Self {
             guard_clock,
             last_update: None,
-            tolerance_ns
+            tolerance,
+            timeout_ns,
+            skewed: false,
         }
     }
 
@@ -247,8 +249,10 @@ impl SafeClock {
         let now = if let &Some((last_main, last_guard)) = &self.last_update {
             let elapsed_main = now_main.wrapping_sub(last_main);
             let elapsed_guard = now_guard.wrapping_sub(last_guard);
-            debug_assert!(elapsed_guard >= 0);
-            if (elapsed_main < 0) || (elapsed_main.wrapping_sub(elapsed_guard).abs() > self.tolerance_ns) {
+            //debug_assert!(elapsed_guard >= 0);
+            let tolerance = ((self.tolerance * (elapsed_guard as f64)) as i64).max(1_500_000); // XXX TODO
+            if ((elapsed_main < 0) || (elapsed_main.wrapping_sub(elapsed_guard).abs() > tolerance)) &&
+                ((!self.skewed) || (elapsed_guard <= self.timeout_ns)) {
                 update_last = false;
                 SafeTimestamp{ nanos: last_main.wrapping_add(elapsed_guard), estimated: true }
             } else {
@@ -260,6 +264,7 @@ impl SafeClock {
         if update_last {
             self.last_update = Some((now_main, now_guard));
         }
+        self.skewed = now.estimated;
         now
     }
 }
@@ -676,17 +681,20 @@ mod tests {
 
     }
 
+    const NS_IN_MS: i64 = 1_000_000;
+
     #[cfg(feature="unix")]
     #[test]
     fn safe_clock() {
-        let epsilon_ns = 5_000_000; // 5 ms
+        let epsilon_ns = 5 * NS_IN_MS;
+        let tolerance = epsilon_ns as f64 / (150f64 * NS_IN_MS as f64);
         let mut overlay = ClockOverlay {
             clock_id: nix::time::ClockId::CLOCK_MONOTONIC_RAW.as_raw() as i64,
             last_sync: 0,
             shift: 0,
             freq_scale: 0.0
         };
-        let mut safe = SafeClock::new(epsilon_ns);
+        let mut safe = SafeClock::new(tolerance, 205 * NS_IN_MS);
 
         let ts1 = safe.now(&overlay);
         assert!(!ts1.estimated);
@@ -710,5 +718,16 @@ mod tests {
         assert!(!ts4.estimated);
         let diff = ts4.nanos.wrapping_sub(ts2.nanos);
         assert!((diff - 149_000_000).abs() < epsilon_ns);
+
+        overlay.shift += 21_000_000;
+        let ts5 = safe.now(&overlay);
+        assert!(ts5.estimated);
+        let diff = ts5.nanos.wrapping_sub(ts2.nanos);
+        assert!((diff - 149_000_000).abs() < epsilon_ns);
+
+        // exceed the timeout, now result must not be estimated:
+        std::thread::sleep(Duration::from_millis(215));
+        let ts6 = safe.now(&overlay);
+        assert!(!ts6.estimated);
     }
 }
