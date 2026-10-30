@@ -173,6 +173,12 @@ impl ClockOverlay {
         //println!("raw freq offset {} result {r} errno {}", timex.freq, errno());
         (timex.freq as f64 / 65_536_000_000.0) + self.freq_scale
     }
+
+    /// Returns actual frequency correction factor. Outside Linux there is no hardware clock to query, so it's the overlay's own scale
+    #[cfg(not(target_os="linux"))]
+    pub fn freq_scale_including_hw(&self) -> f64 {
+        self.freq_scale
+    }
 }
 
 #[cfg(feature="unix")]
